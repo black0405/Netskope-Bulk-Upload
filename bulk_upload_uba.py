@@ -54,6 +54,10 @@ UBA_QUERY: str = "alert_type eq 'uba'"
 # (case-insensitive), e.g. "Bulk Upload", "Bulk Download of Files".
 UBA_KEYWORDS: List[str] = ["upload", "download"]
 
+# Application events are limited to these activities (server-side filter),
+# so Browse, Login, mail etc. never come back.
+APP_ACTIVITIES: List[str] = ["Upload", "Download"]
+
 # Users per application-events query. Keeps the `user in [...]` filter
 # (and the URL) a sane length.
 EMAIL_BATCH: int = 50
@@ -174,8 +178,10 @@ def main() -> int:
         emails = sorted({str(a["user"]).strip() for a in alerts if a.get("user")})
         ns.log.info("users      %d", len(emails))
         events: List[Dict[str, Any]] = []
+        activity = ns.build_term("activity", "in", ",".join(APP_ACTIVITIES))
         for i in range(0, len(emails), EMAIL_BATCH):
-            query = ns.build_term("user", "in", ",".join(emails[i:i + EMAIL_BATCH]))
+            users = ns.build_term("user", "in", ",".join(emails[i:i + EMAIL_BATCH]))
+            query = f"{users} and {activity}"
             events += fetch(session, APP_ENDPOINT, query, start, end, stats)
         write(events, out("AppEvents"))
     except ns.ApiError as exc:
