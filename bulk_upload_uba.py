@@ -2,14 +2,15 @@
 """
 Netskope UBA bulk upload / download -> application events mapping.
 
-  1. Pull UBA alerts for one day      (/api/v2/events/datasearch/alert,
-                                        query: alert_type eq 'uba')
-     and keep only the upload / download ones (alert_name or activity).
-  2. Take the distinct user emails from those alerts and pull that day's
-     application events for just those users
-                                       (/api/v2/events/datasearch/application,
-                                        query: user in ['a@x', 'b@y', ...]).
-  3. Left-join the application events onto the UBA alerts by email.
+  1. Pull UBA alerts                  (/api/v2/events/datasearch/alert,
+                                        query: alert_type eq 'uba' and
+                                        activity in [Upload, Download,
+                                        Download All])
+     -- the same filter as Skope IT > Events & Alerts.
+  2. Take the distinct user emails from those alerts and pull the
+     application events for just those users, same activities
+                                       (/api/v2/events/datasearch/application).
+  3. One row per UBA alert, with that user's events summarised onto it.
 
 Outputs (in ./output):
     UBA_BulkTransfer_<day>.csv     every matching UBA alert, all fields
@@ -48,15 +49,13 @@ AUTH_MODE: str = "bearer"                 # flip to "netskope" on 401s
 
 ALERT_ENDPOINT: str = "/api/v2/events/datasearch/alert"
 APP_ENDPOINT: str = "/api/v2/events/datasearch/application"
-UBA_QUERY: str = "alert_type eq 'uba'"
 
-# A UBA alert is kept when its alert_name or activity contains any of these
-# (case-insensitive), e.g. "Bulk Upload", "Bulk Download of Files".
-UBA_KEYWORDS: List[str] = ["upload", "download"]
-
-# Application events are limited to these activities (server-side filter),
-# so Browse, Login, mail etc. never come back.
-APP_ACTIVITIES: List[str] = ["Upload", "Download"]
+# Same filter as Skope IT > Events & Alerts: Alert Type = UBA and Activity in
+# these. Applied server-side to BOTH the UBA alerts and the application
+# events, so Browse, Login, mail etc. never come back.
+ACTIVITIES: List[str] = ["Upload", "Download", "Download All"]
+UBA_QUERY: str = ("alert_type eq 'uba' and "
+                  + ns.build_term("activity", "in", ",".join(ACTIVITIES)))
 
 # Users per application-events query. Keeps the `user in [...]` filter
 # (and the URL) a sane length.
@@ -68,9 +67,11 @@ LOG_DIR: str = os.path.join(SCRIPT_DIR, "logs")
 # Columns kept in the mapped file. Missing fields export blank.
 UBA_COLUMNS: List[str] = ["user", "alert_name", "activity", "app",
                           "timestamp", "severity", "count", "_id"]
-APP_COLUMNS: List[str] = ["app", "activity", "object_type", "object",
-                          "file_size", "url", "timestamp",
-                          "organization_unit", "_id"]
+COUNT_COLUMNS: List[str] = ["Event Uploads", "Event Downloads",
+                            "Upload Size (MB)", "Download Size (MB)"]
+
+# Excel refuses cells over 32,767 characters; long file lists are cut here.
+CELL_LIMIT: int = 32000
 
 # ---------------------------------------------------------------------------
 
@@ -80,33 +81,53 @@ def email_key(value: Any) -> str:
     return "" if value is None else str(value).strip().casefold()
 
 
-def filter_uba(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Keep UBA alerts whose alert_name/activity mentions a keyword."""
-    keep = []
-    for row in rows:
-        text = f"{row.get('alert_name', '')} {row.get('activity', '')}".lower()
-        if any(k in text for k in UBA_KEYWORDS):
-            keep.append(row)
-    return keep
+def join_unique(values: pd.Series) -> str:
+    """Distinct non-blank values, sorted, '; '-joined, capped for Excel."""
+    text = "; ".join(sorted({str(v).strip() for v in values.dropna()} - {""}))
+    return text[:CELL_LIMIT]
+
+
+def summarise_events(app_rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    """One row per user email: upload/download counts, MB, apps, files."""
+    ev = pd.DataFrame(app_rows).reindex(
+        columns=["user", "activity", "app", "object", "file_size", "timestamp"])
+    ev["_key"] = ev["user"].map(email_key)
+    activity = ev["activity"].fillna("").astype(str).str.strip().str.lower()
+    ev["up"] = activity.eq("upload")
+    ev["down"] = activity.str.startswith("download")    # incl. Download All
+    mb = pd.to_numeric(ev["file_size"], errors="coerce").fillna(0) / (1024 * 1024)
+    ev["up_mb"] = mb.where(ev["up"], 0)
+    ev["down_mb"] = mb.where(ev["down"], 0)
+    ev["ts"] = pd.to_numeric(ev["timestamp"], errors="coerce")
+
+    g = ev.groupby("_key")
+    return pd.DataFrame({
+        "Event Uploads": g["up"].sum(),
+        "Event Downloads": g["down"].sum(),
+        "Upload Size (MB)": g["up_mb"].sum().round(2),
+        "Download Size (MB)": g["down_mb"].sum().round(2),
+        "Event Apps": g["app"].agg(join_unique),
+        "Event Files": g["object"].agg(join_unique),
+        "First Event": g["ts"].min().map(ns.format_epoch),
+        "Last Event": g["ts"].max().map(ns.format_epoch),
+    })
 
 
 def map_events(uba_rows: List[Dict[str, Any]],
                app_rows: List[Dict[str, Any]]) -> pd.DataFrame:
     """
-    Left-join application events onto UBA alerts by email. A UBA alert with
-    no application events still appears once, with the app columns blank.
+    Exactly one row per UBA alert, with that user's application events
+    (matched by email) summarised onto it. No events -> zero counts.
     """
     uba = pd.DataFrame(uba_rows).reindex(columns=UBA_COLUMNS)
-    app = pd.DataFrame(app_rows).reindex(columns=["user"] + APP_COLUMNS)
     uba.columns = [f"UBA {c}" for c in uba.columns]
-    app.columns = ["user"] + [f"Event {c}" for c in APP_COLUMNS]
+    uba["UBA timestamp"] = uba["UBA timestamp"].map(ns.format_epoch)
 
     uba["_key"] = uba["UBA user"].map(email_key)
-    app["_key"] = app.pop("user").map(email_key)
-    mapped = uba.merge(app, on="_key", how="left").drop(columns="_key")
-
-    for col in ("UBA timestamp", "Event timestamp"):
-        mapped[col] = mapped[col].map(ns.format_epoch)
+    mapped = uba.join(summarise_events(app_rows), on="_key").drop(columns="_key")
+    mapped[COUNT_COLUMNS] = mapped[COUNT_COLUMNS].fillna(0)
+    for col in ("Event Uploads", "Event Downloads"):
+        mapped[col] = mapped[col].astype(int)
     return mapped.fillna("")
 
 
@@ -168,9 +189,9 @@ def main() -> int:
 
     try:
         ns.log.info("day        %s", label)
-        alerts = filter_uba(fetch(session, ALERT_ENDPOINT, UBA_QUERY,
-                                  start, end, stats))
-        ns.log.info("UBA alerts matching %s: %d", UBA_KEYWORDS, len(alerts))
+        ns.log.info("UBA query  %s", UBA_QUERY)
+        alerts = fetch(session, ALERT_ENDPOINT, UBA_QUERY, start, end, stats)
+        ns.log.info("UBA alerts %d", len(alerts))
         if not alerts:
             return 3
         write(alerts, out("BulkTransfer"))
@@ -178,7 +199,7 @@ def main() -> int:
         emails = sorted({str(a["user"]).strip() for a in alerts if a.get("user")})
         ns.log.info("users      %d", len(emails))
         events: List[Dict[str, Any]] = []
-        activity = ns.build_term("activity", "in", ",".join(APP_ACTIVITIES))
+        activity = ns.build_term("activity", "in", ",".join(ACTIVITIES))
         for i in range(0, len(emails), EMAIL_BATCH):
             users = ns.build_term("user", "in", ",".join(emails[i:i + EMAIL_BATCH]))
             query = f"{users} and {activity}"
@@ -194,20 +215,32 @@ def main() -> int:
 
 
 def selftest() -> None:
-    alerts = filter_uba([
-        {"user": "A@x.com", "alert_name": "Bulk Upload", "app": "Box"},
-        {"user": "b@x.com", "alert_name": "Bulk Download", "app": "Drive"},
-        {"user": "c@x.com", "alert_name": "Bulk Delete", "app": "Box"},
-    ])
-    assert [a["user"] for a in alerts] == ["A@x.com", "b@x.com"]
+    assert UBA_QUERY == ("alert_type eq 'uba' and activity in "
+                         "['Upload', 'Download', 'Download All']")
+    alerts = [
+        {"user": "A@x.com", "activity": "Upload", "app": "Box"},
+        {"user": "b@x.com", "activity": "Download All", "app": "Drive"},
+    ]
 
+    mb = 1024 * 1024
     mapped = map_events(alerts, [
-        {"user": "a@x.com ", "app": "ChatGPT", "activity": "Upload"},
-        {"user": "a@x.com", "app": "Gemini", "activity": "Post"},
+        {"user": "a@x.com ", "app": "ChatGPT", "activity": "Upload",
+         "object": "a.xlsx", "file_size": 2 * mb, "timestamp": 1760000000},
+        {"user": "a@x.com", "app": "Gemini", "activity": "Upload",
+         "object": "b.csv", "file_size": mb, "timestamp": 1760086400},
+        {"user": "A@X.COM", "app": "Box", "activity": "Download All",
+         "object": "c.pdf", "file_size": mb},
         {"user": "z@x.com", "app": "Box", "activity": "Upload"},
     ])
-    assert len(mapped) == 3                       # 2 for A, 1 blank for b
-    assert list(mapped["Event app"]) == ["ChatGPT", "Gemini", ""]
+    assert len(mapped) == len(alerts)             # one row per alert, always
+    a, b = mapped.iloc[0], mapped.iloc[1]
+    assert (a["Event Uploads"], a["Event Downloads"]) == (2, 1)
+    assert (a["Upload Size (MB)"], a["Download Size (MB)"]) == (3.0, 1.0)
+    assert a["Event Apps"] == "Box; ChatGPT; Gemini"
+    assert a["Event Files"] == "a.xlsx; b.csv; c.pdf"
+    assert a["First Event"] and a["Last Event"]
+    assert (b["Event Uploads"], b["Event Apps"]) == (0, "")   # no events
+    assert len(map_events(alerts, [])) == len(alerts)
     print("selftest OK")
 
 

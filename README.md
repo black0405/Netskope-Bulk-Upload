@@ -34,8 +34,8 @@ python bulk_upload_uba.py --selftest    # offline check
 
 | File | Contents |
 |---|---|
-| `UBA_BulkTransfer_<range>.csv` | UBA alerts whose name/activity mentions upload or download |
+| `UBA_BulkTransfer_<range>.csv` | UBA alerts with activity Upload, Download or Download All (same as Skope IT filter) |
 | `UBA_AppEvents_<range>.csv` | Application events for those users |
-| `UBA_Mapped_<range>.csv` | Alerts left-joined to events by email |
+| `UBA_Mapped_<range>.csv` | One row per UBA alert, with that user's Upload/Download events (matched by email) summarised: counts, size in MB, apps, file names, first/last event date |
 
 Exit codes: 0 ok, 1 config/date error, 2 Netskope API failure, 3 no matching UBA alerts.
