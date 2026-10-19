@@ -67,8 +67,7 @@ LOG_DIR: str = os.path.join(SCRIPT_DIR, "logs")
 # Columns kept in the mapped file. Missing fields export blank.
 UBA_COLUMNS: List[str] = ["user", "alert_name", "activity", "app",
                           "timestamp", "severity", "count", "_id"]
-COUNT_COLUMNS: List[str] = ["Event Uploads", "Event Downloads",
-                            "Upload Size (MB)", "Download Size (MB)"]
+COUNT_COLUMNS: List[str] = ["Matched Events", "Total Size (MB)"]
 
 # Excel refuses cells over 32,767 characters; long file lists are cut here.
 CELL_LIMIT: int = 32000
@@ -76,9 +75,15 @@ CELL_LIMIT: int = 32000
 # ---------------------------------------------------------------------------
 
 
-def email_key(value: Any) -> str:
-    """Normalised join key: 'User@X.com ' and 'user@x.com' are one person."""
-    return "" if value is None else str(value).strip().casefold()
+def norm(value: Any) -> str:
+    """'User@X.com ' == 'user@x.com', 'Upload' == 'upload'. NaN -> ''."""
+    return "" if pd.isna(value) else str(value).strip().casefold()
+
+
+def match_key(users: pd.Series, activities: pd.Series) -> pd.Series:
+    """Join key: email + activity, so an Upload alert gets uploaded files."""
+    # astype(str): an empty Series maps to float64 and "+" would then fail.
+    return users.map(norm).astype(str) + "|" + activities.map(norm).astype(str)
 
 
 def join_unique(values: pd.Series) -> str:
@@ -88,26 +93,19 @@ def join_unique(values: pd.Series) -> str:
 
 
 def summarise_events(app_rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    """One row per user email: upload/download counts, MB, apps, files."""
+    """One row per email + activity: object names, count, MB, apps, dates."""
     ev = pd.DataFrame(app_rows).reindex(
         columns=["user", "activity", "app", "object", "file_size", "timestamp"])
-    ev["_key"] = ev["user"].map(email_key)
-    activity = ev["activity"].fillna("").astype(str).str.strip().str.lower()
-    ev["up"] = activity.eq("upload")
-    ev["down"] = activity.str.startswith("download")    # incl. Download All
-    mb = pd.to_numeric(ev["file_size"], errors="coerce").fillna(0) / (1024 * 1024)
-    ev["up_mb"] = mb.where(ev["up"], 0)
-    ev["down_mb"] = mb.where(ev["down"], 0)
+    ev["_key"] = match_key(ev["user"], ev["activity"])
+    ev["mb"] = pd.to_numeric(ev["file_size"], errors="coerce").fillna(0) / (1024 * 1024)
     ev["ts"] = pd.to_numeric(ev["timestamp"], errors="coerce")
 
     g = ev.groupby("_key")
     return pd.DataFrame({
-        "Event Uploads": g["up"].sum(),
-        "Event Downloads": g["down"].sum(),
-        "Upload Size (MB)": g["up_mb"].sum().round(2),
-        "Download Size (MB)": g["down_mb"].sum().round(2),
+        "Object Names": g["object"].agg(join_unique),
+        "Matched Events": g.size(),
+        "Total Size (MB)": g["mb"].sum().round(2),
         "Event Apps": g["app"].agg(join_unique),
-        "Event Files": g["object"].agg(join_unique),
         "First Event": g["ts"].min().map(ns.format_epoch),
         "Last Event": g["ts"].max().map(ns.format_epoch),
     })
@@ -116,18 +114,19 @@ def summarise_events(app_rows: List[Dict[str, Any]]) -> pd.DataFrame:
 def map_events(uba_rows: List[Dict[str, Any]],
                app_rows: List[Dict[str, Any]]) -> pd.DataFrame:
     """
-    Exactly one row per UBA alert, with that user's application events
-    (matched by email) summarised onto it. No events -> zero counts.
+    Exactly one row per UBA alert. The application events with the same
+    email AND activity are summarised onto it -- that is where the object
+    (file) names come from, since UBA alerts don't carry them.
+    No matching events -> blank names, zero counts.
     """
     uba = pd.DataFrame(uba_rows).reindex(columns=UBA_COLUMNS)
-    uba.columns = [f"UBA {c}" for c in uba.columns]
-    uba["UBA timestamp"] = uba["UBA timestamp"].map(ns.format_epoch)
+    uba["_key"] = match_key(uba["user"], uba["activity"])
+    uba["timestamp"] = uba["timestamp"].map(ns.format_epoch)
+    uba = uba.rename(columns={c: f"UBA {c}" for c in UBA_COLUMNS})
 
-    uba["_key"] = uba["UBA user"].map(email_key)
     mapped = uba.join(summarise_events(app_rows), on="_key").drop(columns="_key")
     mapped[COUNT_COLUMNS] = mapped[COUNT_COLUMNS].fillna(0)
-    for col in ("Event Uploads", "Event Downloads"):
-        mapped[col] = mapped[col].astype(int)
+    mapped["Matched Events"] = mapped["Matched Events"].astype(int)
     return mapped.fillna("")
 
 
@@ -219,27 +218,32 @@ def selftest() -> None:
                          "['Upload', 'Download', 'Download All']")
     alerts = [
         {"user": "A@x.com", "activity": "Upload", "app": "Box"},
-        {"user": "b@x.com", "activity": "Download All", "app": "Drive"},
+        {"user": "a@x.com", "activity": "Download All", "app": "Box"},
+        {"user": "b@x.com", "activity": "Download", "app": "Drive"},
     ]
 
     mb = 1024 * 1024
     mapped = map_events(alerts, [
-        {"user": "a@x.com ", "app": "ChatGPT", "activity": "Upload",
+        {"user": "a@x.com ", "app": "ChatGPT", "activity": "upload",
          "object": "a.xlsx", "file_size": 2 * mb, "timestamp": 1760000000},
         {"user": "a@x.com", "app": "Gemini", "activity": "Upload",
          "object": "b.csv", "file_size": mb, "timestamp": 1760086400},
         {"user": "A@X.COM", "app": "Box", "activity": "Download All",
          "object": "c.pdf", "file_size": mb},
+        {"user": "b@x.com", "app": "Drive", "activity": "Upload",
+         "object": "wrong-activity.txt"},
         {"user": "z@x.com", "app": "Box", "activity": "Upload"},
     ])
     assert len(mapped) == len(alerts)             # one row per alert, always
-    a, b = mapped.iloc[0], mapped.iloc[1]
-    assert (a["Event Uploads"], a["Event Downloads"]) == (2, 1)
-    assert (a["Upload Size (MB)"], a["Download Size (MB)"]) == (3.0, 1.0)
-    assert a["Event Apps"] == "Box; ChatGPT; Gemini"
-    assert a["Event Files"] == "a.xlsx; b.csv; c.pdf"
-    assert a["First Event"] and a["Last Event"]
-    assert (b["Event Uploads"], b["Event Apps"]) == (0, "")   # no events
+    up, dl_all, b = mapped.iloc[0], mapped.iloc[1], mapped.iloc[2]
+    # Upload alert gets only uploaded files, not the Download All one.
+    assert up["Object Names"] == "a.xlsx; b.csv"
+    assert (up["Matched Events"], up["Total Size (MB)"]) == (2, 3.0)
+    assert up["Event Apps"] == "ChatGPT; Gemini"
+    assert up["First Event"] and up["Last Event"]
+    assert (dl_all["Object Names"], dl_all["Matched Events"]) == ("c.pdf", 1)
+    # b only uploaded, so their Download alert matches nothing.
+    assert (b["Object Names"], b["Matched Events"]) == ("", 0)
     assert len(map_events(alerts, [])) == len(alerts)
     print("selftest OK")
 
